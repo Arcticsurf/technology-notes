@@ -1,0 +1,1597 @@
+// ==UserScript==
+// @name         ChatGPT Auth 导出助手
+// @namespace    https://chatgpt.com/
+// @version      0.4.4
+// @description  自动获取 ChatGPT Session，并生成本地 auth.json、原始 Session JSON、CPA、Sub2API、Cockpit、9router、AxonHub 导出内容。
+// @author       P0me1oo
+// @match        https://chatgpt.com/*
+// @grant        GM_registerMenuCommand
+// @grant        GM_setClipboard
+// @run-at       document-idle
+// ==/UserScript==
+
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) {
+    module.exports = factory();
+  } else {
+    factory().init();
+  }
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+  'use strict';
+
+  const SESSION_URL = 'https://chatgpt.com/api/auth/session';
+  const ROOT_ID = 'chatgpt-auth-export-root';
+  const BUTTON_ID = 'chatgpt-auth-export-trigger';
+  const QUICK_MENU_ID = 'chatgpt-auth-export-quick-menu';
+  const STATUS_ID = 'chatgpt-auth-export-status';
+  const MODAL_ID = 'chatgpt-auth-export-modal';
+  const TEXTAREA_ID = 'chatgpt-auth-export-textarea';
+  const MODAL_STATUS_ID = 'chatgpt-auth-export-modal-status';
+  const AXONHUB_PLACEHOLDER_REFRESH_TOKEN = '__missing_refresh_token__';
+  const DEFAULT_EXPORT_TARGET_ID = 'auth';
+  const EXPORT_TARGETS = [
+    { id: 'auth', label: 'auth.json', filename: 'auth.json', group: 'primary' },
+    { id: 'raw-session', label: 'Session JSON', filename: 'session.json', group: 'primary' },
+    { id: 'cpa', label: 'CPA', filename: 'cpa.json', group: 'primary' },
+    { id: 'sub2api', label: 'Sub2API', filename: 'sub2api.json', group: 'primary' },
+    { id: 'cockpit', label: 'Cockpit', filename: 'cockpit.json', group: 'more' },
+    { id: '9router', label: '9router', filename: '9router.json', group: 'more' },
+    { id: 'axonhub', label: 'AxonHub', filename: 'axonhub-auth.json', group: 'more' },
+  ];
+  const EXPORT_TARGET_MAP = EXPORT_TARGETS.reduce(function (result, item) {
+    result[item.id] = item;
+    return result;
+  }, {});
+  const PRIMARY_EXPORT_TARGET_IDS = EXPORT_TARGETS.filter(function (item) {
+    return item.group === 'primary';
+  }).map(function (item) {
+    return item.id;
+  });
+  const MORE_EXPORT_TARGET_IDS = EXPORT_TARGETS.filter(function (item) {
+    return item.group === 'more';
+  }).map(function (item) {
+    return item.id;
+  });
+  const UI_TEXT = {
+    triggerButton: 'Session JSON转换',
+    menuCommand: 'Session JSON转换',
+    modalTitle: 'Session JSON 转换结果',
+    copyCurrent: '复制当前 JSON',
+    downloadCurrent: '下载当前 JSON',
+    enterBatchMode: '批量选择',
+    exitBatchMode: '完成批量选择',
+    selectAll: '全选',
+    clearSelected: '取消全选',
+    downloadSelected: '批量下载已选',
+    quickCopy: '复制',
+    quickDownload: '下载',
+    moreTargets: '更多',
+  };
+  const modalState = {
+    currentTargetId: DEFAULT_EXPORT_TARGET_ID,
+    exports: {},
+    selectedTargetIds: [],
+    isBatchMode: false,
+    quickActionTargetId: '',
+  };
+
+  function getPath(source, path) {
+    const parts = String(path || '').split('.').filter(Boolean);
+    let current = source;
+
+    for (const part of parts) {
+      if (!current || typeof current !== 'object' || !Object.prototype.hasOwnProperty.call(current, part)) {
+        return undefined;
+      }
+
+      current = current[part];
+    }
+
+    return current;
+  }
+
+  function isPlainObject(value) {
+    return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+  }
+
+  function firstNonEmpty() {
+    for (let index = 0; index < arguments.length; index += 1) {
+      const value = arguments[index];
+      if (typeof value === 'string' && value.trim() !== '') {
+        return value.trim();
+      }
+    }
+
+    return undefined;
+  }
+
+  function normalizeTimestamp(value) {
+    if (value instanceof Date && !Number.isNaN(value.getTime())) {
+      return value.toISOString();
+    }
+
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      const milliseconds = value > 1e11 ? value : value * 1000;
+      const numericDate = new Date(milliseconds);
+      return Number.isNaN(numericDate.getTime()) ? undefined : numericDate.toISOString();
+    }
+
+    if (typeof value !== 'string' || value.trim() === '') {
+      return undefined;
+    }
+
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+  }
+
+  function timestampFromUnixSeconds(value) {
+    const numeric = Number(value);
+
+    if (!Number.isFinite(numeric)) {
+      return undefined;
+    }
+
+    const date = new Date(numeric * 1000);
+    return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+  }
+
+  function epochSecondsFromValue(value) {
+    if (value === undefined || value === null || value === '') {
+      return 0;
+    }
+
+    if (value instanceof Date && !Number.isNaN(value.getTime())) {
+      return Math.trunc(value.getTime() / 1000);
+    }
+
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) {
+      return Math.trunc(numeric > 1e11 ? numeric / 1000 : numeric);
+    }
+
+    const parsed = Date.parse(String(value));
+    return Number.isFinite(parsed) ? Math.trunc(parsed / 1000) : 0;
+  }
+
+  function decodeBase64Url(value) {
+    const normalized = String(value).replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=');
+
+    if (typeof Buffer !== 'undefined') {
+      return Buffer.from(padded, 'base64').toString('utf8');
+    }
+
+    if (typeof atob === 'function') {
+      const binary = atob(padded);
+      const bytes = Uint8Array.from(binary, function (character) {
+        return character.charCodeAt(0);
+      });
+      return new TextDecoder().decode(bytes);
+    }
+
+    throw new Error('当前环境不支持 Base64 解码。');
+  }
+
+  function bytesToBase64Url(bytes) {
+    if (typeof Buffer !== 'undefined') {
+      return Buffer.from(bytes)
+        .toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/g, '');
+    }
+
+    let binary = '';
+    for (let index = 0; index < bytes.length; index += 0x8000) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(index, index + 0x8000));
+    }
+
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  }
+
+  function encodeBase64UrlJson(value) {
+    return bytesToBase64Url(new TextEncoder().encode(JSON.stringify(value)));
+  }
+
+  function parseJwtPayload(token) {
+    if (typeof token !== 'string' || token.trim() === '') {
+      return undefined;
+    }
+
+    const segments = token.split('.');
+
+    if (segments.length < 2) {
+      return undefined;
+    }
+
+    try {
+      return JSON.parse(decodeBase64Url(segments[1]));
+    } catch (error) {
+      return undefined;
+    }
+  }
+
+  function getOpenAIAuthSection(payload) {
+    if (!isPlainObject(payload)) {
+      return {};
+    }
+
+    const auth = payload['https://api.openai.com/auth'];
+    return isPlainObject(auth) ? auth : {};
+  }
+
+  function getOpenAIProfileSection(payload) {
+    if (!isPlainObject(payload)) {
+      return {};
+    }
+
+    const profile = payload['https://api.openai.com/profile'];
+    return isPlainObject(profile) ? profile : {};
+  }
+
+  function stripUnavailable(value) {
+    if (Array.isArray(value)) {
+      return value.map(stripUnavailable).filter(function (item) {
+        return item !== undefined;
+      });
+    }
+
+    if (isPlainObject(value)) {
+      const entries = Object.entries(value)
+        .map(function (entry) {
+          return [entry[0], stripUnavailable(entry[1])];
+        })
+        .filter(function (entry) {
+          return entry[1] !== undefined;
+        });
+      return entries.length ? Object.fromEntries(entries) : undefined;
+    }
+
+    if (value === undefined || value === null || value === '') {
+      return undefined;
+    }
+
+    return value;
+  }
+
+  function toEmailKey(email) {
+    if (typeof email !== 'string') {
+      return undefined;
+    }
+
+    return email
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '');
+  }
+
+  function getExpiresIn(expiresAt, now) {
+    if (!expiresAt) {
+      return undefined;
+    }
+
+    const expiresMs = new Date(expiresAt).getTime();
+    if (Number.isNaN(expiresMs)) {
+      return undefined;
+    }
+
+    return Math.max(0, Math.floor((expiresMs - now.getTime()) / 1000));
+  }
+
+  function getAxonHubLastRefresh(expiresAt, now) {
+    const expiresMs = expiresAt ? new Date(expiresAt).getTime() : Number.NaN;
+
+    if (Number.isNaN(expiresMs)) {
+      return now.toISOString();
+    }
+
+    return new Date(expiresMs - 60 * 60 * 1000).toISOString();
+  }
+
+  function resolveNow(options) {
+    const rawNow = options && Object.prototype.hasOwnProperty.call(options, 'now') ? options.now : new Date();
+    const normalized = normalizeTimestamp(rawNow);
+    return normalized ? new Date(normalized) : new Date();
+  }
+
+  // ChatGPT Web session 通常没有真实 id_token，这里构造一个 Codex 可解析的占位 JWT。
+  function buildSyntheticCodexIdToken(email, accountId, planType, userId, expiresAt, options) {
+    if (!accountId) {
+      return undefined;
+    }
+
+    const nowSeconds = epochSecondsFromValue(resolveNow(options));
+    const expires = epochSecondsFromValue(expiresAt) || nowSeconds + 90 * 24 * 60 * 60;
+    const authInfo = {
+      chatgpt_account_id: accountId,
+    };
+
+    if (planType) {
+      authInfo.chatgpt_plan_type = planType;
+    }
+
+    if (userId) {
+      authInfo.chatgpt_user_id = userId;
+      authInfo.user_id = userId;
+    }
+
+    const payload = {
+      iat: nowSeconds,
+      exp: expires,
+      'https://api.openai.com/auth': authInfo,
+    };
+
+    if (email) {
+      payload.email = email;
+    }
+
+    return encodeBase64UrlJson({
+      alg: 'none',
+      typ: 'JWT',
+      cpa_synthetic: true,
+    }) + '.' + encodeBase64UrlJson(payload) + '.synthetic';
+  }
+
+  function validateSessionPayload(session) {
+    const accessToken = String(getPath(session, 'accessToken') || '').trim();
+    const sessionToken = String(getPath(session, 'sessionToken') || '').trim();
+    const accountId = String(getPath(session, 'account.id') || '').trim();
+
+    if (!accessToken) {
+      throw new Error('Session 数据缺少 accessToken。');
+    }
+
+    if (!sessionToken) {
+      throw new Error('Session 数据缺少 sessionToken。');
+    }
+
+    if (!accountId) {
+      throw new Error('Session 数据缺少 account.id。');
+    }
+
+    return {
+      accessToken: accessToken,
+      sessionToken: sessionToken,
+      accountId: accountId,
+    };
+  }
+
+  function readSessionPayload(session) {
+    if (!session || typeof session !== 'object') {
+      throw new Error('Session 数据不是有效 JSON 对象。');
+    }
+
+    const accessToken = String(getPath(session, 'accessToken') || '').trim();
+    const sessionToken = String(getPath(session, 'sessionToken') || '').trim();
+    const accountId = String(getPath(session, 'account.id') || '').trim();
+
+    if (!accessToken) {
+      throw new Error('Session 数据缺少 accessToken。');
+    }
+
+    return {
+      accessToken: accessToken,
+      sessionToken: sessionToken || undefined,
+      accountId: accountId || undefined,
+    };
+  }
+
+  function buildLastRefresh(session, options) {
+    const now = resolveNow(options);
+    const rawIat = getPath(session, 'user.iat');
+    const parsedIat = Number(rawIat);
+
+    if (Number.isFinite(parsedIat) && parsedIat > 0) {
+      return new Date(parsedIat * 1000).toISOString();
+    }
+
+    return new Date(now.getTime() - 60 * 1000).toISOString();
+  }
+
+  function buildConversionContext(session, options) {
+    const tokens = readSessionPayload(session);
+    const accessPayload = parseJwtPayload(tokens.accessToken);
+    const inputIdToken = firstNonEmpty(session.idToken, session.id_token);
+    const idPayload = parseJwtPayload(inputIdToken);
+    const accessAuth = getOpenAIAuthSection(accessPayload);
+    const idAuth = getOpenAIAuthSection(idPayload);
+    const accessProfile = getOpenAIProfileSection(accessPayload);
+    const now = resolveNow(options);
+    const exportedAt = now.toISOString();
+    const expiresAt = firstNonEmpty(
+      timestampFromUnixSeconds(accessPayload && accessPayload.exp),
+      normalizeTimestamp(session.expires),
+      normalizeTimestamp(session.expiresAt),
+      normalizeTimestamp(session.expired),
+      normalizeTimestamp(session.expires_at)
+    );
+    const email = firstNonEmpty(
+      getPath(session, 'user.email'),
+      session.email,
+      accessProfile.email,
+      idPayload && idPayload.email,
+      accessPayload && accessPayload.email
+    );
+    const userId = firstNonEmpty(
+      getPath(session, 'user.id'),
+      session.user_id,
+      accessAuth.chatgpt_user_id,
+      accessAuth.user_id,
+      idAuth.chatgpt_user_id,
+      idAuth.user_id
+    );
+    const planType = firstNonEmpty(
+      getPath(session, 'account.planType'),
+      getPath(session, 'account.plan_type'),
+      session.planType,
+      session.plan_type,
+      accessAuth.chatgpt_plan_type,
+      idAuth.chatgpt_plan_type
+    );
+    const accountId = firstNonEmpty(
+      tokens.accountId,
+      session.account_id,
+      accessAuth.chatgpt_account_id,
+      idAuth.chatgpt_account_id
+    );
+    const refreshToken = firstNonEmpty(session.refreshToken, session.refresh_token);
+    const syntheticIdToken = inputIdToken
+      ? undefined
+      : buildSyntheticCodexIdToken(email, accountId, planType, userId, expiresAt, options);
+    const codexIdToken = firstNonEmpty(inputIdToken, syntheticIdToken, tokens.accessToken);
+
+    return {
+      accessToken: tokens.accessToken,
+      sessionToken: tokens.sessionToken,
+      accountId: accountId,
+      email: email,
+      userId: userId,
+      planType: planType,
+      expiresAt: expiresAt,
+      exportedAt: exportedAt,
+      now: now,
+      refreshToken: refreshToken,
+      authIdToken: tokens.accessToken,
+      codexIdToken: codexIdToken,
+      codexIdTokenSynthetic: Boolean(syntheticIdToken),
+      displayName: firstNonEmpty(email, accountId, 'ChatGPT Account'),
+    };
+  }
+
+  function validateAuthExportContext(context) {
+    if (!context.sessionToken) {
+      throw new Error('auth.json 导出缺少 sessionToken。');
+    }
+
+    if (!context.accountId) {
+      throw new Error('auth.json 导出缺少 account.id，且 accessToken / id_token 中未解析到 chatgpt_account_id。');
+    }
+  }
+
+  function resolveConversionContext(session, options, context) {
+    return context || buildConversionContext(session, options);
+  }
+
+  function buildAuthJson(session, options, context) {
+    const resolvedContext = resolveConversionContext(session, options, context);
+    validateAuthExportContext(resolvedContext);
+
+    return {
+      OPENAI_API_KEY: null,
+      auth_mode: 'chatgpt',
+      last_refresh: buildLastRefresh(session, options),
+      tokens: {
+        access_token: resolvedContext.accessToken,
+        account_id: resolvedContext.accountId,
+        id_token: resolvedContext.accessToken,
+        refresh_token: resolvedContext.sessionToken,
+      },
+    };
+  }
+
+  function buildCpaJson(session, options, context) {
+    const resolvedContext = resolveConversionContext(session, options, context);
+
+    return Object.fromEntries(Object.entries({
+      type: 'codex',
+      account_id: resolvedContext.accountId,
+      chatgpt_account_id: resolvedContext.accountId,
+      email: resolvedContext.email,
+      name: resolvedContext.displayName,
+      plan_type: resolvedContext.planType,
+      chatgpt_plan_type: resolvedContext.planType,
+      id_token: resolvedContext.codexIdToken,
+      id_token_synthetic: resolvedContext.codexIdTokenSynthetic || undefined,
+      access_token: resolvedContext.accessToken,
+      refresh_token: resolvedContext.refreshToken || '',
+      session_token: resolvedContext.sessionToken,
+      last_refresh: resolvedContext.exportedAt,
+      expired: resolvedContext.expiresAt,
+    }).filter(function (entry) {
+      return entry[1] !== undefined && entry[1] !== null;
+    }));
+  }
+
+  function buildCockpitJson(session, options, context) {
+    const resolvedContext = resolveConversionContext(session, options, context);
+
+    return Object.fromEntries(Object.entries({
+      type: 'codex',
+      id_token: resolvedContext.codexIdToken,
+      access_token: resolvedContext.accessToken,
+      refresh_token: resolvedContext.refreshToken || '',
+      account_id: resolvedContext.accountId,
+      last_refresh: resolvedContext.exportedAt,
+      email: resolvedContext.email,
+      expired: resolvedContext.expiresAt,
+    }).filter(function (entry) {
+      return entry[1] !== undefined && entry[1] !== null;
+    }));
+  }
+
+  function buildSub2apiJson(session, options, context) {
+    const resolvedContext = resolveConversionContext(session, options, context);
+    const account = stripUnavailable({
+      name: resolvedContext.displayName,
+      platform: 'openai',
+      type: 'oauth',
+      concurrency: 10,
+      priority: 1,
+      credentials: {
+        access_token: resolvedContext.accessToken,
+        chatgpt_account_id: resolvedContext.accountId,
+        chatgpt_user_id: resolvedContext.userId,
+        email: resolvedContext.email,
+        expires_at: resolvedContext.expiresAt,
+        expires_in: getExpiresIn(resolvedContext.expiresAt, resolvedContext.now),
+        plan_type: resolvedContext.planType,
+      },
+      extra: {
+        email: resolvedContext.email,
+        email_key: toEmailKey(resolvedContext.email),
+        name: resolvedContext.displayName,
+        source: 'chatgpt_web_session',
+        last_refresh: resolvedContext.exportedAt,
+      },
+    });
+
+    return {
+      exported_at: resolvedContext.exportedAt,
+      proxies: [],
+      accounts: account ? [account] : [],
+    };
+  }
+
+  function buildNineRouterJson(session, options, context) {
+    const resolvedContext = resolveConversionContext(session, options, context);
+
+    return stripUnavailable({
+      accessToken: resolvedContext.accessToken,
+      refreshToken: resolvedContext.refreshToken,
+      expiresAt: resolvedContext.expiresAt,
+      testStatus: 'active',
+      expiresIn: getExpiresIn(resolvedContext.expiresAt, resolvedContext.now),
+      providerSpecificData: {
+        chatgptAccountId: resolvedContext.accountId,
+        chatgptPlanType: resolvedContext.planType,
+      },
+      id: resolvedContext.accountId,
+      provider: 'codex',
+      authType: 'oauth',
+      name: resolvedContext.displayName,
+      email: resolvedContext.email,
+      priority: 9,
+      isActive: true,
+      createdAt: resolvedContext.exportedAt,
+      updatedAt: resolvedContext.exportedAt,
+    });
+  }
+
+  function buildAxonHubJson(session, options, context) {
+    const resolvedContext = resolveConversionContext(session, options, context);
+    const refreshToken = resolvedContext.refreshToken || AXONHUB_PLACEHOLDER_REFRESH_TOKEN;
+
+    return stripUnavailable({
+      auth_mode: 'chatgpt',
+      last_refresh: getAxonHubLastRefresh(resolvedContext.expiresAt, resolvedContext.now),
+      tokens: {
+        access_token: resolvedContext.accessToken,
+        refresh_token: refreshToken,
+        id_token: resolvedContext.codexIdToken,
+      },
+      axonhub_refresh_token_placeholder: resolvedContext.refreshToken ? undefined : true,
+      axonhub_note: resolvedContext.refreshToken
+        ? undefined
+        : 'refresh_token is a placeholder; access_token works only until it expires.',
+    });
+  }
+
+  function sanitizeFilenameSegment(value) {
+    if (typeof value !== 'string') {
+      return undefined;
+    }
+
+    const sanitized = value
+      .trim()
+      .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+      .replace(/\s+/g, ' ');
+
+    return sanitized || undefined;
+  }
+
+  function buildDownloadFilename(targetId, email) {
+    const target = EXPORT_TARGET_MAP[targetId] || EXPORT_TARGET_MAP[DEFAULT_EXPORT_TARGET_ID];
+    const safeEmail = sanitizeFilenameSegment(email);
+
+    if (target.id === 'auth' || !safeEmail) {
+      return target.filename;
+    }
+
+    return safeEmail + '----' + target.filename;
+  }
+
+  function buildRawSessionJson(session) {
+    return JSON.stringify(session, null, 2);
+  }
+
+  function buildTargetPayload(targetId, session, options, context) {
+    if (targetId === 'auth') {
+      return buildAuthJson(session, options, context);
+    }
+
+    if (targetId === 'raw-session') {
+      return buildRawSessionJson(session);
+    }
+
+    if (targetId === 'cpa') {
+      return buildCpaJson(session, options, context);
+    }
+
+    if (targetId === 'sub2api') {
+      return buildSub2apiJson(session, options, context);
+    }
+
+    if (targetId === 'cockpit') {
+      return buildCockpitJson(session, options, context);
+    }
+
+    if (targetId === '9router') {
+      return buildNineRouterJson(session, options, context);
+    }
+
+    if (targetId === 'axonhub') {
+      return buildAxonHubJson(session, options, context);
+    }
+
+    throw new Error('不支持的导出目标：' + targetId);
+  }
+
+  function buildExportEntry(session, targetId, options, context) {
+    const target = EXPORT_TARGET_MAP[targetId] || EXPORT_TARGET_MAP[DEFAULT_EXPORT_TARGET_ID];
+    const resolvedContext = context || buildConversionContext(session, options);
+    const payload = buildTargetPayload(target.id, session, options, resolvedContext);
+
+    return {
+      id: target.id,
+      label: target.label,
+      filename: buildDownloadFilename(target.id, resolvedContext.email),
+      text: typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2),
+    };
+  }
+
+  function buildExportEntries(session, options) {
+    const context = buildConversionContext(session, options);
+
+    return EXPORT_TARGETS.reduce(function (result, item) {
+      try {
+        result[item.id] = buildExportEntry(session, item.id, options, context);
+      } catch (error) {
+        result[item.id] = {
+          id: item.id,
+          label: item.label,
+          filename: buildDownloadFilename(item.id, context.email),
+          text: '',
+          error: getErrorMessage(error),
+        };
+      }
+      return result;
+    }, {});
+  }
+
+  function isExportEntryAvailable(exportEntry) {
+    return Boolean(exportEntry) && !exportEntry.error;
+  }
+
+  function getAvailableTargetIds(exportEntries) {
+    return EXPORT_TARGETS.filter(function (item) {
+      return isExportEntryAvailable(exportEntries[item.id]);
+    }).map(function (item) {
+      return item.id;
+    });
+  }
+
+  function normalizeAvailableSelectedTargetIds(exportEntries, targetIds) {
+    const availableTargetIdSet = new Set(getAvailableTargetIds(exportEntries));
+
+    return normalizeSelectedTargetIds(targetIds).filter(function (targetId) {
+      return availableTargetIdSet.has(targetId);
+    });
+  }
+
+  function getPreferredTargetId(exportEntries, preferredTargetId) {
+    if (isExportEntryAvailable(exportEntries[preferredTargetId])) {
+      return preferredTargetId;
+    }
+
+    const availableTargetIds = getAvailableTargetIds(exportEntries);
+    return availableTargetIds[0] || preferredTargetId;
+  }
+
+  function isValidTargetId(targetId) {
+    return Boolean(targetId) && Object.prototype.hasOwnProperty.call(EXPORT_TARGET_MAP, targetId);
+  }
+
+  function normalizeSelectedTargetIds(targetIds) {
+    const input = Array.isArray(targetIds) ? targetIds : [];
+    const selectedSet = new Set(input.filter(isValidTargetId));
+
+    return EXPORT_TARGETS.filter(function (item) {
+      return selectedSet.has(item.id);
+    }).map(function (item) {
+      return item.id;
+    });
+  }
+
+  function toggleSelectedTargetIds(selectedTargetIds, targetId) {
+    const normalized = normalizeSelectedTargetIds(selectedTargetIds);
+
+    if (!isValidTargetId(targetId)) {
+      return normalized;
+    }
+
+    const nextSelected = new Set(normalized);
+
+    if (nextSelected.has(targetId)) {
+      nextSelected.delete(targetId);
+    } else {
+      nextSelected.add(targetId);
+    }
+
+    return normalizeSelectedTargetIds(Array.from(nextSelected));
+  }
+
+  function buildSelectedExportEntries(exportEntries, selectedTargetIds) {
+    return normalizeSelectedTargetIds(selectedTargetIds).map(function (targetId) {
+      return exportEntries[targetId];
+    }).filter(isExportEntryAvailable);
+  }
+
+  function buildDownloadSelectedLabel(selectedTargetIds) {
+    return UI_TEXT.downloadSelected + '（' + normalizeSelectedTargetIds(selectedTargetIds).length + '）';
+  }
+
+  function toggleBatchMode(isBatchMode) {
+    return !Boolean(isBatchMode);
+  }
+
+  function isTargetButtonPressed(targetId, currentTargetId, selectedTargetIds, isBatchMode) {
+    if (isBatchMode) {
+      return normalizeSelectedTargetIds(selectedTargetIds).indexOf(targetId) >= 0;
+    }
+
+    return currentTargetId === targetId;
+  }
+
+  function toggleQuickActionTarget(currentTargetId, targetId) {
+    if (!isValidTargetId(targetId)) {
+      return '';
+    }
+
+    return currentTargetId === targetId ? '' : targetId;
+  }
+
+  async function fetchSession() {
+    const response = await fetch(SESSION_URL, {
+      method: 'GET',
+      credentials: 'include',
+      cache: 'no-store',
+    });
+
+    if (!response.ok) {
+      throw new Error('获取 Session 失败：HTTP ' + response.status);
+    }
+
+    const session = await response.json();
+
+    if (!session || typeof session !== 'object') {
+      throw new Error('获取 Session 失败：返回内容不是有效 JSON 对象。');
+    }
+
+    return session;
+  }
+
+  async function copyText(text) {
+    if (typeof GM_setClipboard === 'function') {
+      GM_setClipboard(text, 'text');
+      return;
+    }
+
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+
+    throw new Error('当前环境不支持剪贴板写入。');
+  }
+
+  function downloadText(filename, text) {
+    const blob = new Blob([text], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+
+    anchor.href = url;
+    anchor.download = filename;
+    anchor.rel = 'noopener';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(function () {
+      URL.revokeObjectURL(url);
+    }, 0);
+  }
+
+  function renderTargetSelectors(targetIds) {
+    return targetIds.map(function (targetId) {
+      const target = EXPORT_TARGET_MAP[targetId];
+      return [
+        '<div class="chatgpt-auth-export-selector-item">',
+        '  <button type="button" data-preview-target-id="' + target.id + '" aria-pressed="' +
+          String(target.id === DEFAULT_EXPORT_TARGET_ID) + '">' + target.label + '</button>',
+        '</div>',
+      ].join('');
+    }).join('');
+  }
+
+  function renderQuickMenuItems() {
+    return EXPORT_TARGETS.map(function (target) {
+      return [
+        '<div class="chatgpt-auth-export-quick-item">',
+        '  <button type="button" class="chatgpt-auth-export-quick-target" data-quick-target-id="' + target.id + '" aria-expanded="false">' + target.label + '</button>',
+        '  <div class="chatgpt-auth-export-quick-actions" data-quick-actions-for="' + target.id + '" hidden>',
+        '    <button type="button" data-quick-action="copy" data-target-id="' + target.id + '">' + UI_TEXT.quickCopy + '</button>',
+        '    <button type="button" data-quick-action="download" data-target-id="' + target.id + '">' + UI_TEXT.quickDownload + '</button>',
+        '  </div>',
+        '</div>',
+      ].join('');
+    }).join('');
+  }
+
+  function ensureStyle() {
+    if (document.getElementById('chatgpt-auth-export-style')) {
+      return;
+    }
+
+    const style = document.createElement('style');
+    style.id = 'chatgpt-auth-export-style';
+    style.textContent = `
+      #${ROOT_ID} {
+        position: fixed;
+        right: 20px;
+        bottom: 20px;
+        z-index: 2147483646;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: 8px;
+      }
+      #${ROOT_ID}[data-busy="true"] {
+        pointer-events: none;
+      }
+      #${BUTTON_ID} {
+        border: 1px solid rgba(15, 23, 42, 0.16);
+        border-radius: 8px;
+        background: #ffffff;
+        color: #111827;
+        font: 13px/1.2 "Segoe UI", Arial, sans-serif;
+        padding: 10px 12px;
+        cursor: pointer;
+        box-shadow: 0 12px 30px rgba(15, 23, 42, 0.12);
+      }
+      #${BUTTON_ID}:hover {
+        background: #f8fafc;
+      }
+      #${BUTTON_ID}:disabled {
+        cursor: wait;
+        opacity: 0.72;
+      }
+      #${QUICK_MENU_ID} {
+        display: none;
+        min-width: 220px;
+        border: 1px solid rgba(15, 23, 42, 0.16);
+        border-radius: 10px;
+        background: #ffffff;
+        padding: 8px;
+        box-shadow: 0 12px 30px rgba(15, 23, 42, 0.12);
+      }
+      #${ROOT_ID}:hover #${QUICK_MENU_ID} {
+        display: block;
+      }
+      #${QUICK_MENU_ID} .chatgpt-auth-export-quick-item + .chatgpt-auth-export-quick-item {
+        margin-top: 8px;
+      }
+      #${QUICK_MENU_ID} .chatgpt-auth-export-quick-target {
+        width: 100%;
+        text-align: left;
+      }
+      #${QUICK_MENU_ID} .chatgpt-auth-export-quick-actions {
+        display: flex;
+        gap: 8px;
+        margin-top: 6px;
+      }
+      #${QUICK_MENU_ID} button {
+        border: 1px solid rgba(15, 23, 42, 0.14);
+        border-radius: 8px;
+        background: #ffffff;
+        color: #111827;
+        font: 13px/1.2 "Segoe UI", Arial, sans-serif;
+        padding: 8px 12px;
+        cursor: pointer;
+      }
+      #${QUICK_MENU_ID} button:hover {
+        background: #f8fafc;
+      }
+      #${STATUS_ID} {
+        position: fixed;
+        right: 20px;
+        bottom: 64px;
+        z-index: 2147483646;
+        max-width: 320px;
+        border-radius: 8px;
+        background: rgba(17, 24, 39, 0.92);
+        color: #ffffff;
+        font: 12px/1.4 "Segoe UI", Arial, sans-serif;
+        padding: 8px 10px;
+        display: none;
+        white-space: pre-wrap;
+      }
+      #${MODAL_ID} {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483647;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        background: rgba(15, 23, 42, 0.48);
+      }
+      #${MODAL_ID}[data-open="true"] {
+        display: flex;
+      }
+      #${MODAL_ID} .chatgpt-auth-export-dialog {
+        width: min(900px, calc(100vw - 32px));
+        max-height: calc(100vh - 32px);
+        overflow: auto;
+        background: #ffffff;
+        color: #111827;
+        border-radius: 8px;
+        box-shadow: 0 24px 60px rgba(15, 23, 42, 0.24);
+        padding: 16px;
+        box-sizing: border-box;
+      }
+      #${MODAL_ID} .chatgpt-auth-export-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 12px;
+      }
+      #${MODAL_ID} .chatgpt-auth-export-title {
+        font: 600 16px/1.3 "Segoe UI", Arial, sans-serif;
+      }
+      #${MODAL_ID} .chatgpt-auth-export-selectors {
+        margin-bottom: 12px;
+      }
+      #${MODAL_ID} .chatgpt-auth-export-selector-group {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      #${MODAL_ID} .chatgpt-auth-export-selector-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      #${MODAL_ID} .chatgpt-auth-export-selector-check {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 22px;
+        min-width: 22px;
+      }
+      #${MODAL_ID} .chatgpt-auth-export-more {
+        margin-top: 10px;
+      }
+      #${MODAL_ID} .chatgpt-auth-export-more summary {
+        cursor: pointer;
+        color: #111827;
+        font: 600 13px/1.2 "Segoe UI", Arial, sans-serif;
+        user-select: none;
+      }
+      #${MODAL_ID} .chatgpt-auth-export-more[open] summary {
+        margin-bottom: 8px;
+      }
+      #${MODAL_ID} .chatgpt-auth-export-actions {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin-bottom: 12px;
+      }
+      #${MODAL_ID} .chatgpt-auth-export-batch-controls {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      #${MODAL_ID} button {
+        border: 1px solid rgba(15, 23, 42, 0.14);
+        border-radius: 8px;
+        background: #ffffff;
+        color: #111827;
+        font: 13px/1.2 "Segoe UI", Arial, sans-serif;
+        padding: 8px 12px;
+        cursor: pointer;
+      }
+      #${MODAL_ID} button:hover {
+        background: #f8fafc;
+      }
+      #${MODAL_ID} button[aria-pressed="true"] {
+        background: #111827;
+        border-color: #111827;
+        color: #ffffff;
+      }
+      #${TEXTAREA_ID} {
+        width: 100%;
+        min-height: 360px;
+        resize: vertical;
+        box-sizing: border-box;
+        border: 1px solid rgba(15, 23, 42, 0.14);
+        border-radius: 8px;
+        background: #0f172a;
+        color: #e5e7eb;
+        font: 12px/1.5 Consolas, "Courier New", monospace;
+        padding: 12px;
+      }
+      #${MODAL_STATUS_ID} {
+        margin-top: 10px;
+        color: #374151;
+        font: 12px/1.4 "Segoe UI", Arial, sans-serif;
+      }
+    `;
+
+    document.head.appendChild(style);
+  }
+
+  function showStatus(message, timeoutMs) {
+    const element = ensureStatusElement();
+    element.textContent = message;
+    element.style.display = 'block';
+
+    if (showStatus.timer) {
+      clearTimeout(showStatus.timer);
+    }
+
+    if (timeoutMs !== 0) {
+      showStatus.timer = setTimeout(function () {
+        element.style.display = 'none';
+      }, typeof timeoutMs === 'number' ? timeoutMs : 3200);
+    }
+  }
+
+  function ensureStatusElement() {
+    let element = document.getElementById(STATUS_ID);
+
+    if (!element) {
+      element = document.createElement('div');
+      element.id = STATUS_ID;
+      document.body.appendChild(element);
+    }
+
+    return element;
+  }
+
+  function ensureRootContainer() {
+    let root = document.getElementById(ROOT_ID);
+
+    if (!root) {
+      root = document.createElement('div');
+      root.id = ROOT_ID;
+      root.setAttribute('data-busy', 'false');
+      root.addEventListener('mouseleave', function () {
+        closeQuickActions();
+      });
+      document.body.appendChild(root);
+    }
+
+    return root;
+  }
+
+  function setUiBusy(isBusy) {
+    const busy = Boolean(isBusy);
+    const root = document.getElementById(ROOT_ID);
+    const button = document.getElementById(BUTTON_ID);
+
+    if (root) {
+      root.setAttribute('data-busy', String(busy));
+    }
+
+    if (button) {
+      button.disabled = busy;
+    }
+  }
+
+  function ensureTriggerButton() {
+    let button = document.getElementById(BUTTON_ID);
+
+    if (!button) {
+      button = document.createElement('button');
+      button.id = BUTTON_ID;
+      button.type = 'button';
+      button.textContent = UI_TEXT.triggerButton;
+      button.addEventListener('click', function () {
+        void exportAuthJson();
+      });
+      ensureRootContainer().appendChild(button);
+    }
+
+    return button;
+  }
+
+  function ensureQuickMenu() {
+    let quickMenu = document.getElementById(QUICK_MENU_ID);
+
+    if (!quickMenu) {
+      const root = ensureRootContainer();
+      quickMenu = document.createElement('div');
+      quickMenu.id = QUICK_MENU_ID;
+      quickMenu.innerHTML = renderQuickMenuItems();
+
+      quickMenu.querySelectorAll('[data-quick-target-id]').forEach(function (button) {
+        button.addEventListener('click', function () {
+          const targetId = button.getAttribute('data-quick-target-id');
+          modalState.quickActionTargetId = toggleQuickActionTarget(modalState.quickActionTargetId, targetId);
+          updateQuickActionMenu();
+        });
+      });
+
+      quickMenu.querySelectorAll('[data-quick-action]').forEach(function (button) {
+        button.addEventListener('click', function () {
+          const targetId = button.getAttribute('data-target-id');
+          const action = button.getAttribute('data-quick-action');
+          void runQuickAction(targetId, action);
+        });
+      });
+
+      root.insertBefore(quickMenu, root.firstChild);
+    }
+
+    return quickMenu;
+  }
+
+  function ensureModal() {
+    let modal = document.getElementById(MODAL_ID);
+
+    if (!modal) {
+      modal = document.createElement('div');
+      modal.id = MODAL_ID;
+      modal.setAttribute('data-open', 'false');
+      modal.innerHTML = [
+        '<div class="chatgpt-auth-export-dialog" role="dialog" aria-modal="true" aria-labelledby="chatgpt-auth-export-title">',
+        '  <div class="chatgpt-auth-export-header">',
+        '    <div id="chatgpt-auth-export-title" class="chatgpt-auth-export-title">' + UI_TEXT.modalTitle + '</div>',
+        '    <button type="button" data-action="close">关闭</button>',
+        '  </div>',
+        '  <div class="chatgpt-auth-export-selectors">',
+        '    <div class="chatgpt-auth-export-selector-group">',
+        renderTargetSelectors(PRIMARY_EXPORT_TARGET_IDS),
+        '    </div>',
+        '    <details class="chatgpt-auth-export-more">',
+        '      <summary>' + UI_TEXT.moreTargets + '</summary>',
+        '      <div class="chatgpt-auth-export-selector-group">',
+        renderTargetSelectors(MORE_EXPORT_TARGET_IDS),
+        '      </div>',
+        '    </details>',
+        '  </div>',
+        '  <div class="chatgpt-auth-export-actions">',
+        '    <button type="button" data-action="copy-current">' + UI_TEXT.copyCurrent + '</button>',
+        '    <button type="button" data-action="download-current">' + UI_TEXT.downloadCurrent + '</button>',
+        '    <button type="button" data-action="toggle-batch-mode">' + UI_TEXT.enterBatchMode + '</button>',
+        '    <div class="chatgpt-auth-export-batch-controls" data-batch-controls hidden>',
+        '      <button type="button" data-action="select-all">' + UI_TEXT.selectAll + '</button>',
+        '      <button type="button" data-action="clear-selected">' + UI_TEXT.clearSelected + '</button>',
+        '      <button type="button" data-action="download-selected">' + buildDownloadSelectedLabel([]) + '</button>',
+        '    </div>',
+        '  </div>',
+        '  <textarea id="' + TEXTAREA_ID + '" readonly spellcheck="false"></textarea>',
+        '  <div id="' + MODAL_STATUS_ID + '"></div>',
+        '</div>',
+      ].join('');
+
+      modal.addEventListener('click', function (event) {
+        if (event.target === modal) {
+          closeModal();
+        }
+      });
+
+      modal.querySelector('[data-action="close"]').addEventListener('click', closeModal);
+      modal.querySelector('[data-action="toggle-batch-mode"]').addEventListener('click', handleToggleBatchMode);
+      modal.querySelector('[data-action="select-all"]').addEventListener('click', handleSelectAllTargets);
+      modal.querySelector('[data-action="clear-selected"]').addEventListener('click', handleClearSelectedTargets);
+      modal.querySelector('[data-action="download-selected"]').addEventListener('click', handleDownloadSelectedFromModal);
+      modal.querySelector('[data-action="copy-current"]').addEventListener('click', function () {
+        void handleCopyCurrentFromModal();
+      });
+      modal.querySelector('[data-action="download-current"]').addEventListener('click', function () {
+        handleDownloadFromModal();
+      });
+      modal.querySelectorAll('[data-preview-target-id]').forEach(function (button) {
+        button.addEventListener('click', function () {
+          handleTargetButtonClick(button.getAttribute('data-preview-target-id'));
+        });
+      });
+
+      document.body.appendChild(modal);
+    }
+
+    return modal;
+  }
+
+  function setModalStatus(message) {
+    const status = document.getElementById(MODAL_STATUS_ID);
+    if (status) {
+      status.textContent = message;
+    }
+  }
+
+  function updateTargetButtonStates() {
+    const modal = document.getElementById(MODAL_ID);
+    if (!modal) {
+      return;
+    }
+
+    modal.querySelectorAll('[data-preview-target-id]').forEach(function (button) {
+      const targetId = button.getAttribute('data-preview-target-id');
+      const exportEntry = modalState.exports[targetId];
+      const isAvailable = isExportEntryAvailable(exportEntry);
+
+      button.disabled = !isAvailable;
+      button.setAttribute('aria-disabled', String(!isAvailable));
+      button.title = isAvailable ? '' : getErrorMessage(exportEntry && exportEntry.error);
+      button.setAttribute('aria-pressed', String(
+        isTargetButtonPressed(targetId, modalState.currentTargetId, modalState.selectedTargetIds, modalState.isBatchMode)
+      ));
+    });
+  }
+
+  function updateBatchModeUi() {
+    const modal = document.getElementById(MODAL_ID);
+    if (!modal) {
+      return;
+    }
+
+    const isBatchMode = Boolean(modalState.isBatchMode);
+    const toggleButton = modal.querySelector('[data-action="toggle-batch-mode"]');
+    const batchControls = modal.querySelector('[data-batch-controls]');
+    const downloadSelectedButton = modal.querySelector('[data-action="download-selected"]');
+
+    if (toggleButton) {
+      toggleButton.textContent = isBatchMode ? UI_TEXT.exitBatchMode : UI_TEXT.enterBatchMode;
+      toggleButton.setAttribute('aria-pressed', String(isBatchMode));
+    }
+
+    if (batchControls) {
+      batchControls.hidden = !isBatchMode;
+    }
+
+    if (downloadSelectedButton) {
+      downloadSelectedButton.textContent = buildDownloadSelectedLabel(modalState.selectedTargetIds);
+    }
+    updateTargetButtonStates();
+  }
+
+  function updateSelectedTargetCheckboxes() {
+    modalState.selectedTargetIds = normalizeAvailableSelectedTargetIds(modalState.exports, modalState.selectedTargetIds);
+    updateBatchModeUi();
+  }
+
+  function updateQuickActionMenu() {
+    const quickMenu = document.getElementById(QUICK_MENU_ID);
+    if (!quickMenu) {
+      return;
+    }
+
+    quickMenu.querySelectorAll('[data-quick-target-id]').forEach(function (button) {
+      const targetId = button.getAttribute('data-quick-target-id');
+      button.setAttribute('aria-expanded', String(modalState.quickActionTargetId === targetId));
+    });
+
+    quickMenu.querySelectorAll('[data-quick-actions-for]').forEach(function (container) {
+      container.hidden = container.getAttribute('data-quick-actions-for') !== modalState.quickActionTargetId;
+    });
+  }
+
+  function closeQuickActions() {
+    modalState.quickActionTargetId = '';
+    updateQuickActionMenu();
+  }
+
+  function getCurrentExportEntry() {
+    return modalState.exports[modalState.currentTargetId];
+  }
+
+  function buildCurrentOutputMessage(targetId) {
+    const target = EXPORT_TARGET_MAP[targetId] || EXPORT_TARGET_MAP[DEFAULT_EXPORT_TARGET_ID];
+    const usage = target.id === 'auth' ? '，可用于Codex APP/CLI' : '';
+
+    return '当前输出：' + target.filename + usage + '，可复制或下载用于' + target.label + '。';
+  }
+
+  function selectExportTarget(targetId) {
+    const modal = ensureModal();
+    const target = modalState.exports[targetId];
+    const textarea = modal.querySelector('#' + TEXTAREA_ID);
+
+    if (!target || !textarea) {
+      return;
+    }
+
+    if (!isExportEntryAvailable(target)) {
+      setModalStatus(target.label + ' 当前不可导出：' + getErrorMessage(target.error));
+      return;
+    }
+
+    modalState.currentTargetId = targetId;
+    textarea.value = target.text;
+    updateTargetButtonStates();
+    setModalStatus(buildCurrentOutputMessage(targetId));
+  }
+
+  function openModal(exportEntries) {
+    const modal = ensureModal();
+    const preferredTargetId = getPreferredTargetId(exportEntries, DEFAULT_EXPORT_TARGET_ID);
+
+    modalState.exports = exportEntries;
+    modalState.currentTargetId = preferredTargetId;
+    modalState.selectedTargetIds = normalizeAvailableSelectedTargetIds(exportEntries, modalState.selectedTargetIds);
+    modalState.isBatchMode = false;
+    modal.setAttribute('data-open', 'true');
+    updateSelectedTargetCheckboxes();
+    updateBatchModeUi();
+    selectExportTarget(preferredTargetId);
+
+    if (preferredTargetId !== DEFAULT_EXPORT_TARGET_ID && exportEntries[DEFAULT_EXPORT_TARGET_ID] && exportEntries[DEFAULT_EXPORT_TARGET_ID].error) {
+      setModalStatus(
+        exportEntries[DEFAULT_EXPORT_TARGET_ID].label + ' 当前不可导出：' +
+        getErrorMessage(exportEntries[DEFAULT_EXPORT_TARGET_ID].error) +
+        ' 已自动切换到 ' + (EXPORT_TARGET_MAP[preferredTargetId] || EXPORT_TARGET_MAP[DEFAULT_EXPORT_TARGET_ID]).label + '。'
+      );
+    }
+  }
+
+  function closeModal() {
+    const modal = document.getElementById(MODAL_ID);
+    if (modal) {
+      modal.setAttribute('data-open', 'false');
+    }
+  }
+
+  function handleToggleBatchMode() {
+    modalState.isBatchMode = toggleBatchMode(modalState.isBatchMode);
+    updateBatchModeUi();
+    setModalStatus(modalState.isBatchMode
+      ? '已进入批量选择模式，可勾选多个导出目标。'
+      : '已退出批量选择模式，已保留上次勾选结果。');
+  }
+
+  function handleTargetButtonClick(targetId) {
+    if (modalState.isBatchMode) {
+      handleToggleSelectedTarget(targetId);
+      return;
+    }
+
+    selectExportTarget(targetId);
+  }
+
+  function handleToggleSelectedTarget(targetId) {
+    modalState.selectedTargetIds = toggleSelectedTargetIds(modalState.selectedTargetIds, targetId);
+    updateSelectedTargetCheckboxes();
+    setModalStatus('已选择 ' + modalState.selectedTargetIds.length + ' 个导出目标，可批量下载。');
+  }
+
+  function handleSelectAllTargets() {
+    modalState.selectedTargetIds = getAvailableTargetIds(modalState.exports).map(function (targetId) {
+      return targetId;
+    });
+    updateSelectedTargetCheckboxes();
+    setModalStatus('已全选 ' + modalState.selectedTargetIds.length + ' 个可导出目标。');
+  }
+
+  function handleClearSelectedTargets() {
+    modalState.selectedTargetIds = [];
+    updateSelectedTargetCheckboxes();
+    setModalStatus('已取消全部批量下载选择。');
+  }
+
+  function handleDownloadSelectedFromModal() {
+    const selectedEntries = buildSelectedExportEntries(modalState.exports, modalState.selectedTargetIds);
+
+    if (!selectedEntries.length) {
+      const message = '批量下载失败：请先选择至少一个可导出的目标。';
+      setModalStatus(message);
+      showStatus(message, 5000);
+      return;
+    }
+
+    try {
+      selectedEntries.forEach(function (entry) {
+        downloadText(entry.filename, entry.text);
+      });
+      setModalStatus('已触发 ' + selectedEntries.length + ' 个文件下载。');
+      showStatus('已开始批量下载 ' + selectedEntries.length + ' 个文件。');
+    } catch (error) {
+      const message = '批量下载失败：' + getErrorMessage(error);
+      setModalStatus(message);
+      showStatus(message, 5000);
+    }
+  }
+
+  async function handleCopyCurrentFromModal() {
+    const current = getCurrentExportEntry();
+
+    if (!current || !isExportEntryAvailable(current)) {
+      return;
+    }
+
+    try {
+      await copyText(current.text);
+      setModalStatus('已复制 ' + current.label + ' 到剪贴板。');
+      showStatus('已复制 ' + current.label + ' 到剪贴板。');
+    } catch (error) {
+      setModalStatus(getErrorMessage(error));
+      showStatus(getErrorMessage(error), 5000);
+    }
+  }
+
+  function handleDownloadFromModal() {
+    const current = getCurrentExportEntry();
+
+    if (!current || !isExportEntryAvailable(current)) {
+      return;
+    }
+
+    try {
+      downloadText(current.filename, current.text);
+      setModalStatus('已触发 ' + current.filename + ' 下载。');
+      showStatus('已开始下载 ' + current.filename + '。');
+    } catch (error) {
+      setModalStatus(getErrorMessage(error));
+      showStatus(getErrorMessage(error), 5000);
+    }
+  }
+
+  async function runQuickAction(targetId, action) {
+    const target = EXPORT_TARGET_MAP[targetId];
+    const actionName = action === 'download' ? '下载' : '复制';
+
+    if (!target) {
+      return;
+    }
+
+    setUiBusy(true);
+
+    try {
+      showStatus('正在获取 ChatGPT Session...', 0);
+      const session = await fetchSession();
+      const exportEntry = buildExportEntry(session, targetId);
+
+      if (action === 'download') {
+        downloadText(exportEntry.filename, exportEntry.text);
+        showStatus('已开始下载 ' + exportEntry.filename + '。');
+      } else {
+        await copyText(exportEntry.text);
+        showStatus('已复制 ' + target.label + ' 到剪贴板。');
+      }
+
+      closeQuickActions();
+    } catch (error) {
+      showStatus(actionName + ' ' + target.label + ' 失败：' + getErrorMessage(error), 5000);
+    } finally {
+      setUiBusy(false);
+    }
+  }
+
+  function getErrorMessage(error) {
+    return error && error.message ? error.message : String(error);
+  }
+
+  async function exportAuthJson() {
+    ensureTriggerButton();
+    setUiBusy(true);
+
+    try {
+      showStatus('正在获取 ChatGPT Session...', 0);
+      const session = await fetchSession();
+      const exportEntries = buildExportEntries(session);
+
+      closeQuickActions();
+      openModal(exportEntries);
+      showStatus('已生成 7 种导出结果。');
+    } catch (error) {
+      showStatus(getErrorMessage(error), 5000);
+    } finally {
+      setUiBusy(false);
+    }
+  }
+
+  function registerMenuCommand() {
+    if (typeof GM_registerMenuCommand === 'function') {
+      GM_registerMenuCommand(UI_TEXT.menuCommand, function () {
+        void exportAuthJson();
+      });
+    }
+  }
+
+  function init() {
+    if (typeof window === 'undefined' || typeof document === 'undefined') {
+      return;
+    }
+
+    if (window.top !== window.self) {
+      return;
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', init, { once: true });
+      return;
+    }
+
+    ensureStyle();
+    ensureRootContainer();
+    ensureStatusElement();
+    ensureQuickMenu();
+    ensureTriggerButton();
+    ensureModal();
+    updateQuickActionMenu();
+    registerMenuCommand();
+  }
+
+  return {
+    AXONHUB_PLACEHOLDER_REFRESH_TOKEN: AXONHUB_PLACEHOLDER_REFRESH_TOKEN,
+    DEFAULT_EXPORT_TARGET_ID: DEFAULT_EXPORT_TARGET_ID,
+    EXPORT_TARGETS: EXPORT_TARGETS,
+    MORE_EXPORT_TARGET_IDS: MORE_EXPORT_TARGET_IDS,
+    PRIMARY_EXPORT_TARGET_IDS: PRIMARY_EXPORT_TARGET_IDS,
+    UI_TEXT: UI_TEXT,
+    build9routerJson: buildNineRouterJson,
+    buildAuthJson: buildAuthJson,
+    buildAxonHubJson: buildAxonHubJson,
+    buildCockpitJson: buildCockpitJson,
+    buildCurrentOutputMessage: buildCurrentOutputMessage,
+    buildCpaJson: buildCpaJson,
+    buildDownloadSelectedLabel: buildDownloadSelectedLabel,
+    buildDownloadFilename: buildDownloadFilename,
+    buildExportEntry: buildExportEntry,
+    buildExportEntries: buildExportEntries,
+    buildLastRefresh: buildLastRefresh,
+    buildRawSessionJson: buildRawSessionJson,
+    buildSelectedExportEntries: buildSelectedExportEntries,
+    buildSub2apiJson: buildSub2apiJson,
+    fetchSession: fetchSession,
+    getPath: getPath,
+    init: init,
+    isTargetButtonPressed: isTargetButtonPressed,
+    normalizeSelectedTargetIds: normalizeSelectedTargetIds,
+    toggleBatchMode: toggleBatchMode,
+    toggleQuickActionTarget: toggleQuickActionTarget,
+    toggleSelectedTargetIds: toggleSelectedTargetIds,
+    validateSessionPayload: validateSessionPayload,
+  };
+});
